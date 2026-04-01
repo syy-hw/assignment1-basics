@@ -71,11 +71,17 @@ def pair_counts(word_counter: dict[tuple[int, ...], int]) -> dict[tuple[int, int
             pairs_freqs[(a, b)] = pairs_freqs.get((a, b), 0) + count
     return pairs_freqs
 
-def get_most_frequent_pair(pairs_freqs: dict[tuple[int, int], int]) -> tuple[int, int]:
-    max_freq = max(pairs_freqs.values())
-    candidates = [pair for pair, freq in pairs_freqs.items() if freq == max_freq]
-    res = max(candidates)
-    return res
+def get_most_frequent_pair(
+    pair_counter: dict[tuple[int, int], int], vocab: dict[int, bytes]
+) -> tuple[int, int]:
+    max_freq = max(pair_counter.values())
+
+    candidates = [
+        (pair, (vocab[pair[0]], vocab[pair[1]])) for pair, freq in pair_counter.items() if freq == max_freq
+    ]
+    candidates.sort(key=lambda x: (x[1][0], x[1][1]), reverse=True)
+
+    return candidates[0][0]
 
 def add_pair_to_vocab(vocab: dict[int, bytes], pair: tuple[int, int]) -> int:
     index1, index2 = pair
@@ -165,7 +171,7 @@ def train_bpe(
     vocab = init_vocab(special_tokens)
     num_merges = vocab_size - len(vocab)
 
-    merges: dict[tuple[int, int], int] = {}
+    merges: list[tuple[bytes, bytes]] = []
 
     with open(input_path, "rb") as f:
         chunk_boundaries = find_chunk_boundaries(
@@ -195,20 +201,76 @@ def train_bpe(
     for p in processes:
         p.join()
     
-    pairs_counter = Counter()
+    pairs_counter: Counter = Counter()
     pair_to_words: dict[tuple[int, int], set[tuple[int, ...]]] = defaultdict(set)
-    for word in word_counter:
+    for word, count in word_counter.items():
         for i in range(len(word) - 1):
             pair = (word[i], word[i + 1])
+            pairs_counter[pair] += count
             pair_to_words[pair].add(word)
-            pairs_counter[pair] += word_counter[word]
-
-    pairs_freqs = pair_counts(word_counter)
 
     for _ in range(num_merges):
-        most_common_pair = get_most_frequent_pair(pairs_freqs)
-        new_index = add_pair_to_vocab(vocab, most_common_pair)
-        merges[most_common_pair] = new_index
-        word_counter, pairs_freqs = merge_pair_ids(word_counter, most_common_pair, new_index)
-    
+        if not pairs_counter:
+            break
+
+        best_pair = get_most_frequent_pair(pairs_counter, vocab)
+
+        # Record merge before modifying vocab
+        merges.append((vocab[best_pair[0]], vocab[best_pair[1]]))
+        new_index = add_pair_to_vocab(vocab, best_pair)
+
+        # Incremental update: only process words that contain the merged pair
+        affected_words = list(pair_to_words.get(best_pair, set()))
+
+        for word in affected_words:
+            count = word_counter.get(word, 0)
+            if count == 0:
+                continue
+
+            # Build new word by replacing best_pair with new_index
+            new_word_list = []
+            i = 0
+            L = len(word)
+            while i < L:
+                if i + 1 < L and word[i] == best_pair[0] and word[i + 1] == best_pair[1]:
+                    new_word_list.append(new_index)
+                    i += 2
+                else:
+                    new_word_list.append(word[i])
+                    i += 1
+            new_word = tuple(new_word_list)
+
+            # Aggregate old pair counts (handle duplicate pairs in same word)
+            old_delta: Counter = Counter()
+            for a, b in zip(word, word[1:]):
+                old_delta[(a, b)] += count
+
+            new_delta: Counter = Counter()
+            for a, b in zip(new_word, new_word[1:]):
+                new_delta[(a, b)] += count
+
+            # Subtract old pair contributions
+            for pair_key, delta in old_delta.items():
+                current = pairs_counter.get(pair_key, 0) - delta
+                if current <= 0:
+                    pairs_counter.pop(pair_key, None)
+                else:
+                    pairs_counter[pair_key] = current
+                pair_to_words[pair_key].discard(word)
+                if not pair_to_words[pair_key]:
+                    pair_to_words.pop(pair_key, None)
+
+            # Add new pair contributions
+            for pair_key, delta in new_delta.items():
+                pairs_counter[pair_key] = pairs_counter.get(pair_key, 0) + delta
+                pair_to_words.setdefault(pair_key, set()).add(new_word)
+
+            # Update word counter
+            del word_counter[word]
+            word_counter[new_word] = word_counter.get(new_word, 0) + count
+
+        # Ensure merged pair is fully removed
+        pairs_counter.pop(best_pair, None)
+        pair_to_words.pop(best_pair, None)
+
     return vocab, merges
