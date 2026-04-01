@@ -1,7 +1,58 @@
-from collections import Counter
+from collections import Counter, defaultdict
+from multiprocessing import Manager, Process, Queue
+from queue import Empty
 import os
+from typing import BinaryIO
 import regex as re
 
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+NUM_PROCESSES = min(4, os.cpu_count() or 1)
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
 
 def init_vocab(special_tokens: list[str]) -> dict[int, bytes]:
     vocab : dict[int, bytes] = {x : bytes([x]) for x in range(256)}
@@ -70,9 +121,6 @@ def split_by_special_tokens(text: str, special_tokens: list[str], include_specia
     return special_chunks
 
 
-PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-
-
 def string_to_bytes(s: str, return_int: bool = False) -> list[int] | list[bytes]:
     byte_array = s.encode("utf-8")
     return list(map(int, byte_array)) if return_int else [bytes([b]) for b in byte_array]
@@ -94,6 +142,20 @@ def pre_tokenize(string: str, special_tokens: list[str], including_special: bool
 
     return word_counter
 
+def pre_tokenize_string_worker(*args):
+    input_path, special_tokens, queue, start, end, include_special = args
+
+    # Read the chunk from the file
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+
+    word_counter = pre_tokenize(chunk, special_tokens, include_special)
+
+    # Put the result in the queue
+    queue.put(word_counter)
+
+
 def train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -105,7 +167,41 @@ def train_bpe(
 
     merges: dict[tuple[int, int], int] = {}
 
-    word_counter = pre_tokenize(string, special_tokens, including_special=False)
+    with open(input_path, "rb") as f:
+        chunk_boundaries = find_chunk_boundaries(
+            f, desired_num_chunks=kwargs.get("desired_num_chunks", NUM_PROCESSES), split_special_token=b"<|endoftext|>"
+        )
+    
+    manager = Manager()
+    queue = manager.Queue()
+    processes: list[Process] = []
+    
+    for start, end in zip(chunk_boundaries[:-1], chunk_boundaries[1:]):
+        p = Process(
+            target=pre_tokenize_string_worker,
+            args=(input_path, special_tokens, queue, start, end, False),
+        )
+        processes.append(p)
+        p.start()
+
+    word_counter = Counter()
+
+    for _ in range(len(processes)):
+        try:
+            partial_counter = queue.get(timeout=10)
+            word_counter.update(partial_counter)
+        except Empty:
+            continue
+    for p in processes:
+        p.join()
+    
+    pairs_counter = Counter()
+    pair_to_words: dict[tuple[int, int], set[tuple[int, ...]]] = defaultdict(set)
+    for word in word_counter:
+        for i in range(len(word) - 1):
+            pair = (word[i], word[i + 1])
+            pair_to_words[pair].add(word)
+            pairs_counter[pair] += word_counter[word]
 
     pairs_freqs = pair_counts(word_counter)
 
