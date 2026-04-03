@@ -88,28 +88,23 @@ def add_pair_to_vocab(vocab: dict[int, bytes], pair: tuple[int, int]) -> int:
     vocab[len(vocab)] = vocab[index1] + vocab[index2]
     return len(vocab) - 1
 
-def merge_pair_ids(
-    word_counter: dict[tuple[int, ...], int],
-    pair: tuple[int, int],
-    new_index: int
-)-> tuple[dict[tuple[int, ...], int], dict[tuple[int, int], int]]:
-    new_word_counter: dict[tuple[int, ...], int] = {}
-    new_pairs_freqs: dict[tuple[int, int], int] = {}
-    for word, count in word_counter.items():
-        new_word = []
-        i = 0
-        L = len(word)
-        while i < L:
-            if i + 1 < L and word[i:i+2] == pair:
-                new_word.append(new_index)
-                i += 2
-            else:
-                new_word.append(word[i])
-                i += 1
-        new_word_counter[tuple(new_word)] = count
-        for a, b in zip(new_word, new_word[1:]):
-            new_pairs_freqs[(a, b)] = new_pairs_freqs.get((a, b), 0) + count
-    return new_word_counter, new_pairs_freqs
+def merge(indices, most_frequent_pair, new_index) -> list:
+    new_indices = []
+    i = 0
+
+    while i < len(indices):
+        if (
+            i + 1 < len(indices)
+            and indices[i] == most_frequent_pair[0]
+            and indices[i + 1] == most_frequent_pair[1]
+        ):
+            new_indices.append(new_index)
+            i += 2
+        else:
+            new_indices.append(indices[i])
+            i += 1
+
+    return new_indices
 
 def split_by_special_tokens(text: str, special_tokens: list[str], include_special: bool = False) -> list[str]:
     if not special_tokens:
